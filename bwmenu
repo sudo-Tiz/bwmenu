@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+
+shopt -s nullglob globstar
+
+# Parse arguments
+typeit=0
+askpass_agent=""
+
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		-t|--type)
+			typeit=1
+			shift
+			;;
+		-h|--help)
+			echo "Usage: bwmenu [-t|--type] [-a|--askpass AGENT] [-h|--help]"
+			echo "  -t, --type        Type fields instead of copying"
+			echo "  -a, --askpass     Specify askpass agent (pinentry|zenity|rofi|wofi)"
+			exit 0
+			;;
+		-a|--askpass)
+			askpass_agent="$2"
+			shift 2
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+# Detect display environment and set tools accordingly
+if [[ -n $WAYLAND_DISPLAY ]]; then
+	dmenu="wofi -p bw -d -i"
+	xdotool="ydotool type --file -"
+	xclip="wl-copy"
+	# TODO:
+	clipOFF=""
+	clipON=""
+elif [[ -n $DISPLAY ]]; then
+	dmenu="dmenu"
+	xdotool="xdotool type --clearmodifiers --file -"
+	xclip="xclip -r -selection clipboard"
+	clipOFF="clipctl disable"
+	clipON="clipctl enable"
+else
+	echo "Error: No Wayland or X11 display detected" >&2
+	exit 1
+fi
+
+# Ensure clipboard is re-enabled on exit
+trap '$clipON' EXIT
+
+# Detect password prompt agent
+detect_askpass_agent() {
+	# Priority: CLI option > env var > auto-detect
+	local agent="${askpass_agent:-${BW_ASKPASS}}"
+	
+	if [[ -n $agent ]]; then
+		if command -v "$agent" >/dev/null 2>&1; then
+			echo "$agent"
+			return 0
+		else
+			echo "Error: Specified askpass agent '$agent' not found, falling back to auto-detection" >&2
+		fi
+	fi
+	
+	# Auto-detect
+	if command -v pinentry >/dev/null 2>&1; then
+		echo "pinentry"
+	elif command -v zenity >/dev/null 2>&1; then
+		echo "zenity"
+	elif [[ -n $WAYLAND_DISPLAY ]] && command -v wofi >/dev/null 2>&1; then
+		echo "wofi"
+	elif [[ -n $DISPLAY ]] && command -v rofi >/dev/null 2>&1; then
+		echo "rofi"
+	else
+		echo "Error: No password dialog available (pinentry, zenity, rofi, wofi)" >&2
+		echo "Please install one of these tools or run from a terminal" >&2
+		return 1
+	fi
+}
+
+# Prompt for password using detected agent
+prompt_password() {
+	local agent="$1"
+	local password=""
+	
+	case "$agent" in
+		pinentry)
+			password=$(echo -e "SETTITLE Bitwarden\nSETDESC Enter your master password\nSETPROMPT Password:\nGETPIN" | pinentry 2>/dev/null | grep '^D ' | cut -d' ' -f2-)
+			;;
+		zenity)
+			password=$(zenity --password --title="Bitwarden Master Password" 2>/dev/null)
+			;;
+		rofi)
+			password=$(echo "" | rofi -dmenu -password -p "Bitwarden Master Password" -lines 0 2>/dev/null)
+			;;
+		wofi)
+			password=$(echo "" | wofi --show dmenu --password --lines 1 -p "Bitwarden Master Password" 2>/dev/null)
+			;;
+		*)
+			password=$("$agent" 2>/dev/null)
+			;;
+	esac
+	
+	if [[ -n $password ]]; then
+		echo "$password"
+		return 0
+	fi
+	return 1
+}
+
+# Get BW session using keyctl
+get_bw_session() {
+	local name=${BW_KEY:-bw}
+	local timeout=${BW_TIMEOUT:-0}
+	local key
+
+	# Check if session exists in keyctl
+	key=$(keyctl search @u user "$name" 2>/dev/null)
+	if [[ -n $key ]]; then
+		BW_SESSION=$(keyctl pipe "$key" 2>/dev/null)
+		if [[ -n $BW_SESSION ]]; then
+			# Verify the session is still valid
+			export BW_SESSION
+			local status=$(bw status 2>/dev/null | jq -r '.status // empty')
+			if [[ $status == "unlocked" ]]; then
+				# Reset timeout
+				((timeout > 0)) && keyctl timeout "$key" "$timeout"
+				return 0
+			fi
+			# Session is invalid, remove it
+			keyctl unlink "$key" @u 2>/dev/null
+			unset BW_SESSION
+		fi
+	fi
+
+	# Need to unlock with password
+	local agent password
+	agent=$(detect_askpass_agent) || return 1
+	
+	local attempts=0
+	while ((attempts < 3)); do
+		password=$(prompt_password "$agent") || return 1
+		
+		if BW_SESSION=$(echo "$password" | bw unlock --raw 2>/dev/null); then
+			unset password
+			key=$(keyctl add user "$name" "$BW_SESSION" @u)
+			((timeout > 0)) && keyctl timeout "$key" "$timeout"
+			return 0
+		fi
+		
+		unset password
+		((attempts++))
+	done
+	
+	return 1
+}
+
+# Main execution
+get_bw_session || exit 1
+
+# Get list of items and display in menu
+items=$(bw list items | jq -r '.[] | .id + "\t" + .name')
+selected=$(echo "$items" | $dmenu)
+
+[[ -n $selected ]] || exit
+
+# Extract item ID
+item_id=$(echo "$selected" | cut -f1)
+
+# Get full item details
+item_json=$(bw get item "$item_id")
+
+# Extract fields
+username=$(echo "$item_json" | jq -r '.login.username // empty')
+password=$(echo "$item_json" | jq -r '.login.password // empty')
+totp_secret=$(echo "$item_json" | jq -r '.login.totp // empty')
+
+# Process username
+if [[ -n $username ]]; then
+	$clipOFF
+	if [[ $typeit -eq 0 ]]; then
+		echo "$username" | $xclip
+		notify-send "bwmenu" "login copied"
+	else
+		echo "$username" | $xdotool
+		notify-send "bwmenu" "login typed"
+	fi
+	sleep 3
+fi
+
+# Process password
+if [[ -n $password ]]; then
+	$clipOFF
+	if [[ $typeit -eq 0 ]]; then
+		echo "$password" | $xclip
+		notify-send "bwmenu" "password copied"
+	else
+		echo "$password" | $xdotool
+		notify-send "bwmenu" "password typed"
+	fi
+	sleep 5
+fi
+
+# Process TOTP
+if [[ -n $totp_secret ]]; then
+	# Extract secret from TOTP URI if needed
+	if [[ $totp_secret == otpauth://* ]]; then
+		totp_secret=$(echo "$totp_secret" | grep -oP 'secret=\K[^&]*')
+	fi
+	
+	if otp=$(oathtool -b --totp "$totp_secret" 2>/dev/null); then
+		$clipOFF
+		if [[ $typeit -eq 0 ]]; then
+			echo "$otp" | $xclip
+			notify-send "bwmenu" "otp copied"
+		else
+			echo "$otp" | $xdotool
+			notify-send "bwmenu" "otp typed"
+		fi
+	fi
+fi

@@ -5,8 +5,7 @@ bindir := $(PREFIX)/bin
 .PHONY: install uninstall
 
 install:
-	mkdir -p $(bindir)
-	install -m 755 bwmenu $(bindir)/bwmenu
+	install -Dm755 bwmenu $(bindir)/bwmenu
 
 uninstall:
 	rm -f $(bindir)/bwmenu
